@@ -1,6 +1,7 @@
 services:
   php-svc:
     image: php:8.5.11-fpm-alpine3.23
+    platform: linux/amd64
     container_name: php-svc
     command: php -S 0.0.0.0:8000 -t /app
     networks:
@@ -17,6 +18,7 @@ services:
 
   nginx-svc:
     image: nginx:1.27-alpine
+    platform: linux/amd64
     container_name: nginx-svc
     networks:
       - php-nginx-net

