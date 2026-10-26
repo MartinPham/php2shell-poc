@@ -1,0 +1,30 @@
+services:
+  php-svc:
+    image: php:8.5.11-fpm-alpine3.23
+    container_name: php-svc
+    command: php -S 0.0.0.0:8000 -t /app
+    networks:
+      - php-nginx-net
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=32m,mode=1777
+    mem_limit: 1g
+    volumes:
+      - ./lab/public:/app:ro
+      - ./lab/test-bin:/usr/local/bin/test-bin:ro
+    environment:
+      - PHP_CLI_SERVER_WORKERS=4
+
+  nginx-svc:
+    image: nginx:1.27-alpine
+    container_name: nginx-svc
+    networks:
+      - php-nginx-net
+    ports:
+      - "127.0.0.1:18166:80"
+    volumes:
+      - ./lab/nginx.conf:/etc/nginx/nginx.conf:ro
+
+networks:
+  php-nginx-net:
+    driver: bridge
